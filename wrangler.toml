@@ -1,0 +1,4 @@
+name = "nexapulse-compute"
+main = "index.ts"
+compatibility_date = "2026-11-12"
+workers_dev = true
