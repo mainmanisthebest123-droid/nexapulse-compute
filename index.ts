@@ -1,98 +1,46 @@
 export interface Env {
   SUPABASE_URL: string;
   SUPABASE_SERVICE_ROLE_KEY: string;
-  NP_CONTROL_TOKEN: string;
-  NP_NODE_API_KEY: string;
+  SUPABASE_ANON_KEY: string;
+  NP_OWNER_USER_IDS: string; // comma-separated Supabase Auth UUIDs
+  NP_ENROLLMENT_TTL_SECONDS?: string;
+  NP_NODE_LEASE_SECONDS?: string;
 }
 
-type ComputeNode = {
+type Enrollment = {
   id: string;
   name: string;
   provider: string;
   endpoint_url: string;
   model_id: string;
   capabilities: string[];
-  status: string;
-  last_seen_at: string;
+  public_key: string;
+  session_id: string;
+  status: "pending" | "approved" | "rejected" | "expired";
+  created_at: string;
+  expires_at: string;
+  approved_by?: string | null;
+  approved_at?: string | null;
+  last_seen_at?: string | null;
 };
 
-const corsHeaders = {
+const cors: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type,Authorization",
+  "Access-Control-Max-Age": "86400",
 };
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
-    headers: {
-      ...corsHeaders,
-      "Content-Type": "application/json",
-      "Cache-Control": "no-store",
-    },
+    headers: { "Content-Type": "application/json", ...cors },
   });
 }
 
-function getBearerToken(request: Request): string | null {
-  const header = request.headers.get("Authorization");
-  if (!header) return null;
-
-  const match = header.match(/^Bearer\s+(.+)$/i);
-  return match ? match[1].trim() : null;
-}
-
-function constantTimeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-
-  let result = 0;
-
-  for (let i = 0; i < a.length; i++) {
-    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-
-  return result === 0;
-}
-
-function requireControlAuth(request: Request, env: Env): boolean {
-  const token = getBearerToken(request);
-  return !!token && constantTimeEqual(token, env.NP_CONTROL_TOKEN);
-}
-
-function safeEndpoint(value: string): string {
-  let url: URL;
-
-  try {
-    url = new URL(value);
-  } catch {
-    throw new Error("Invalid notebook endpoint URL.");
-  }
-
-  const allowedHosts = [
-    "ngrok-free.app",
-    "ngrok.app",
-    "ngrok-free.dev",
-    "ngrok.io",
-  ];
-
-  const allowedHost = allowedHosts.some(
-    (host) =>
-      url.hostname === host ||
-      url.hostname.endsWith("." + host)
-  );
-
-  if (
-    url.protocol !== "https:" ||
-    !allowedHost ||
-    url.username ||
-    url.password ||
-    url.port
-  ) {
-    throw new Error(
-      "Endpoint must be an HTTPS ngrok URL on an approved ngrok domain."
-    );
-  }
-
-  return url.origin;
+function uuid(value: unknown): value is string {
+  return typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
 function supabaseHeaders(env: Env): HeadersInit {
@@ -103,413 +51,188 @@ function supabaseHeaders(env: Env): HeadersInit {
   };
 }
 
-function supabaseUrl(env: Env, path: string): string {
-  return `${env.SUPABASE_URL.replace(/\/$/, "")}/rest/v1/${path}`;
-}
-
-async function supabaseRequest(
-  env: Env,
-  path: string,
-  init: RequestInit = {}
-): Promise<Response> {
-  return fetch(supabaseUrl(env, path), {
+async function db(env: Env, path: string, init: RequestInit = {}): Promise<Response> {
+  return fetch(`${env.SUPABASE_URL.replace(/\/$/, "")}/rest/v1/${path}`, {
     ...init,
-    headers: {
-      ...supabaseHeaders(env),
-      ...(init.headers || {}),
-    },
+    headers: { ...supabaseHeaders(env), ...(init.headers || {}) },
   });
 }
 
-async function handleRequest(
-  request: Request,
-  env: Env
-): Promise<Response> {
-  if (request.method === "OPTIONS") {
-    return new Response(null, {
-      status: 204,
-      headers: corsHeaders,
-    });
-  }
+async function currentUser(request: Request, env: Env): Promise<{ id: string } | null> {
+  const token = request.headers.get("Authorization")?.replace(/^Bearer\s+/i, "");
+  if (!token) return null;
+  const response = await fetch(`${env.SUPABASE_URL.replace(/\/$/, "")}/auth/v1/user`, {
+    headers: { apikey: env.SUPABASE_ANON_KEY, Authorization: `Bearer ${token}` },
+  });
+  if (!response.ok) return null;
+  const user = await response.json() as { id?: string };
+  return uuid(user.id) ? { id: user.id } : null;
+}
 
+async function requireOwner(request: Request, env: Env): Promise<{ id: string } | null> {
+  const user = await currentUser(request, env);
+  if (!user) return null;
+  const owners = (env.NP_OWNER_USER_IDS || "").split(",").map(x => x.trim()).filter(Boolean);
+  return owners.includes(user.id) ? user : null;
+}
+
+function safeTunnel(input: unknown): string | null {
+  if (typeof input !== "string" || input.length > 500) return null;
+  try {
+    const url = new URL(input);
+    const hostOk = url.hostname === "trycloudflare.com" ||
+      url.hostname.endsWith(".trycloudflare.com");
+    if (url.protocol !== "https:" || !hostOk || url.username || url.password || url.port) return null;
+    return url.origin;
+  } catch { return null; }
+}
+
+async function readJson(request: Request): Promise<any | null> {
+  try { return await request.json(); } catch { return null; }
+}
+
+async function verifyEd25519(publicKeyB64: string, message: string, signatureB64: string): Promise<boolean> {
+  try {
+    const decode = (s: string) => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+    const key = await crypto.subtle.importKey(
+      "raw", decode(publicKeyB64), { name: "Ed25519" }, false, ["verify"]
+    );
+    return await crypto.subtle.verify(
+      "Ed25519", key, decode(signatureB64), new TextEncoder().encode(message)
+    );
+  } catch { return false; }
+}
+
+async function handle(request: Request, env: Env): Promise<Response> {
+  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
   const url = new URL(request.url);
   const path = url.pathname;
 
-  // Health check
   if (request.method === "GET" && path === "/health") {
-    return json({
-      status: "ok",
-      service: "nexapulse-compute-api",
-      version: "0.2.0",
-    });
+    return json({ status: "ok", service: "nexapulse-compute-api", version: "1.0.0" });
   }
 
-  // Protect all versioned API routes
-  if (
-    path.startsWith("/v1/") &&
-    !requireControlAuth(request, env)
-  ) {
-    return json({ error: "Unauthorized" }, 401);
-  }
+  if (request.method === "POST" && path === "/v1/enrollments") {
+    const body = await readJson(request);
+    if (!body || !body.name || !body.provider || !body.model_id ||
+        typeof body.session_id !== "string" || body.session_id.length < 12 ||
+        typeof body.public_key !== "string") return json({ error: "Missing or invalid enrollment fields." }, 400);
 
-  // Register a compute node
-  if (
-    request.method === "POST" &&
-    path === "/v1/nodes/register"
-  ) {
-    let body: any;
+    const endpoint = safeTunnel(body.endpoint_url);
+    if (!endpoint) return json({ error: "Endpoint must be an HTTPS Cloudflare Quick Tunnel (*.trycloudflare.com)." }, 400);
 
+    // Verify that the submitted tunnel currently serves this exact notebook session.
+    let health: Response;
     try {
-      body = await request.json();
-    } catch {
-      return json({ error: "Invalid JSON body." }, 400);
+      health = await fetch(`${endpoint}/health`, { signal: AbortSignal.timeout(8000) });
+    } catch { return json({ error: "Could not reach notebook health endpoint." }, 400); }
+    if (!health.ok) return json({ error: "Notebook health endpoint returned an error." }, 400);
+    const healthBody = await health.json().catch(() => ({})) as any;
+    if (healthBody?.service !== "nexapulse-compute-node" ||
+        healthBody?.session_id !== body.session_id) {
+      return json({ error: "Notebook health check did not match the submitted session." }, 400);
     }
 
-    if (
-      !body?.name ||
-      !body?.provider ||
-      !body?.endpoint_url ||
-      !body?.model_id
-    ) {
-      return json(
-        { error: "Missing required node registration fields." },
-        400
-      );
-    }
-
-    let endpoint: string;
-
-    try {
-      endpoint = safeEndpoint(body.endpoint_url);
-    } catch (error) {
-      return json(
-        {
-          error:
-            error instanceof Error
-              ? error.message
-              : "Invalid endpoint.",
-        },
-        400
-      );
-    }
-
-    const node: ComputeNode = {
+    const ttl = Math.min(3600, Math.max(300, Number(env.NP_ENROLLMENT_TTL_SECONDS || 900)));
+    const row: Enrollment = {
       id: crypto.randomUUID(),
-      name: String(body.name).slice(0, 120),
+      name: String(body.name).slice(0, 100),
       provider: String(body.provider).slice(0, 40),
       endpoint_url: endpoint,
       model_id: String(body.model_id).slice(0, 200),
       capabilities: Array.isArray(body.capabilities)
-        ? body.capabilities
-            .filter((item: unknown) => typeof item === "string")
-            .slice(0, 30)
-        : ["text", "chat-completions"],
-      status: "online",
-      last_seen_at: new Date().toISOString(),
+        ? body.capabilities.filter((x: unknown) => typeof x === "string").slice(0, 20)
+        : ["text"],
+      public_key: body.public_key,
+      session_id: body.session_id,
+      status: "pending",
+      created_at: new Date().toISOString(),
+      expires_at: new Date(Date.now() + ttl * 1000).toISOString(),
     };
-
-    const response = await supabaseRequest(
-      env,
-      "compute_nodes",
-      {
-        method: "POST",
-        headers: {
-          Prefer: "return=representation",
-        },
-        body: JSON.stringify(node),
-      }
-    );
-
+    const response = await db(env, "compute_enrollments", {
+      method: "POST",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify(row),
+    });
     if (!response.ok) {
-      const detail = await response.text();
-
-      console.error(
-        "Node registration failed:",
-        response.status,
-        detail
-      );
-
-      return json(
-        { error: "Database registration failed." },
-        502
-      );
+      console.error("Enrollment insert failed", response.status, await response.text());
+      return json({ error: "Could not save enrollment." }, 502);
     }
-
-    return json(
-      {
-        success: true,
-        node,
-      },
-      201
-    );
+    return json({ enrollment_id: row.id, status: "pending", expires_at: row.expires_at }, 201);
   }
 
-  // Node heartbeat
-  if (
-    request.method === "POST" &&
-    path === "/v1/nodes/heartbeat"
-  ) {
-    let body: any;
+  if (path.startsWith("/v1/")) {
+    const owner = await requireOwner(request, env);
+    if (!owner) return json({ error: "Unauthorized." }, 401);
 
-    try {
-      body = await request.json();
-    } catch {
-      return json({ error: "Invalid JSON body." }, 400);
+    if (request.method === "GET" && path === "/v1/enrollments") {
+      const response = await db(env, "compute_enrollments?select=id,name,provider,model_id,capabilities,status,created_at,expires_at,last_seen_at&order=created_at.desc&limit=100");
+      if (!response.ok) return json({ error: "Could not load enrollments." }, 502);
+      return new Response(await response.text(), { headers: { "Content-Type": "application/json", ...cors } });
     }
 
-    if (!body?.node_id) {
-      return json(
-        { error: "node_id is required." },
-        400
-      );
-    }
-
-    const nodeId = encodeURIComponent(
-      String(body.node_id)
-    );
-
-    const response = await supabaseRequest(
-      env,
-      `compute_nodes?id=eq.${nodeId}`,
-      {
+    const approveMatch = path.match(/^\/v1\/enrollments\/([0-9a-f-]+)\/approve$/i);
+    if (request.method === "POST" && approveMatch) {
+      const id = approveMatch[1];
+      const now = new Date().toISOString();
+      const response = await db(env, `compute_enrollments?id=eq.${id}&status=eq.pending`, {
         method: "PATCH",
-        headers: {
-          Prefer: "return=representation",
-        },
-        body: JSON.stringify({
-          status: "online",
-          last_seen_at: new Date().toISOString(),
-        }),
-      }
-    );
-
-    if (!response.ok) {
-      console.error(
-        "Heartbeat update failed:",
-        response.status,
-        await response.text()
-      );
-
-      return json(
-        { error: "Heartbeat update failed." },
-        502
-      );
-    }
-
-    const updated =
-      (await response.json()) as ComputeNode[];
-
-    if (!updated.length) {
-      return json({ error: "Node not found." }, 404);
-    }
-
-    return json({
-      success: true,
-      node_id: body.node_id,
-      status: "online",
-    });
-  }
-
-  // List registered nodes
-  if (
-    request.method === "GET" &&
-    path === "/v1/nodes"
-  ) {
-    const response = await supabaseRequest(
-      env,
-      "compute_nodes?select=id,name,provider,endpoint_url,model_id,capabilities,status,last_seen_at&order=last_seen_at.desc"
-    );
-
-    if (!response.ok) {
-      console.error(
-        "Node listing failed:",
-        response.status,
-        await response.text()
-      );
-
-      return json(
-        { error: "Could not retrieve nodes." },
-        502
-      );
-    }
-
-    const nodes =
-      (await response.json()) as ComputeNode[];
-
-    return json({
-      nodes: nodes || [],
-      count: nodes?.length || 0,
-    });
-  }
-
-  // OpenAI-compatible chat completions proxy
-  if (
-    request.method === "POST" &&
-    path === "/v1/chat/completions"
-  ) {
-    let body: any;
-
-    try {
-      body = await request.json();
-    } catch {
-      return json({ error: "Invalid JSON body." }, 400);
-    }
-
-    if (!Array.isArray(body?.messages)) {
-      return json(
-        { error: "A messages array is required." },
-        400
-      );
-    }
-
-    const modelId = body.model
-      ? String(body.model)
-      : null;
-
-    const query = new URLSearchParams({
-      select:
-        "id,name,endpoint_url,model_id,last_seen_at",
-      status: "eq.online",
-      order: "last_seen_at.desc",
-      limit: "10",
-    });
-
-    if (modelId) {
-      query.set("model_id", `eq.${modelId}`);
-    }
-
-    const nodeResponse = await supabaseRequest(
-      env,
-      `compute_nodes?${query.toString()}`
-    );
-
-    if (!nodeResponse.ok) {
-      console.error(
-        "Node lookup failed:",
-        nodeResponse.status,
-        await nodeResponse.text()
-      );
-
-      return json(
-        { error: "Could not locate a model runtime." },
-        502
-      );
-    }
-
-    const nodes =
-      (await nodeResponse.json()) as ComputeNode[];
-
-    const now = Date.now();
-
-    const node = nodes.find((candidate) => {
-      const lastSeen = Date.parse(
-        candidate.last_seen_at
-      );
-
-      return (
-        Number.isFinite(lastSeen) &&
-        now - lastSeen <= 180_000
-      );
-    });
-
-    if (!node) {
-      return json(
-        {
-          error:
-            "No active runtime is available for this model.",
-          code: "model_unavailable",
-        },
-        503
-      );
-    }
-
-    const targetUrl =
-      `${node.endpoint_url.replace(/\/$/, "")}` +
-      `/v1/chat/completions`;
-
-    let upstream: Response;
-
-    try {
-      upstream = await fetch(targetUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${env.NP_NODE_API_KEY}`,
-        },
-        body: JSON.stringify({
-          ...body,
-          model: node.model_id,
-        }),
-        signal: AbortSignal.timeout(120_000),
+        headers: { Prefer: "return=representation" },
+        body: JSON.stringify({ status: "approved", approved_by: owner.id, approved_at: now }),
       });
-    } catch (error) {
-      console.error(
-        "Notebook runtime request failed:",
-        error
-      );
-
-      return json(
-        {
-          error: "Could not reach the notebook runtime.",
-          code: "runtime_unreachable",
-        },
-        502
-      );
+      const rows = response.ok ? await response.json() as any[] : [];
+      if (!response.ok) return json({ error: "Approval failed." }, 502);
+      if (!rows.length) return json({ error: "Pending enrollment not found; it may have expired or already been handled." }, 404);
+      return json({ id, status: "approved", approved_at: now });
     }
 
-    const responseBody = await upstream.text();
-
-    return new Response(responseBody, {
-      status: upstream.status,
-      headers: {
-        ...corsHeaders,
-        "Content-Type":
-          upstream.headers.get("Content-Type") ||
-          "application/json",
-        "Cache-Control": "no-store",
-      },
-    });
+    const rejectMatch = path.match(/^\/v1\/enrollments\/([0-9a-f-]+)\/reject$/i);
+    if (request.method === "POST" && rejectMatch) {
+      const response = await db(env, `compute_enrollments?id=eq.${rejectMatch[1]}&status=eq.pending`, {
+        method: "PATCH",
+        headers: { Prefer: "return=representation" },
+        body: JSON.stringify({ status: "rejected" }),
+      });
+      if (!response.ok) return json({ error: "Rejection failed." }, 502);
+      const rows = await response.json() as any[];
+      return rows.length ? json({ status: "rejected" }) : json({ error: "Pending enrollment not found." }, 404);
+    }
   }
 
-  return json(
-    { error: "Route not found." },
-    404
-  );
+  if (request.method === "POST" && path === "/v1/nodes/heartbeat") {
+    const body = await readJson(request);
+    if (!body || !uuid(body.enrollment_id) || typeof body.timestamp !== "number" ||
+        typeof body.signature !== "string") return json({ error: "Invalid heartbeat." }, 400);
+    if (Math.abs(Date.now() - body.timestamp) > 60_000) return json({ error: "Heartbeat timestamp outside allowed window." }, 401);
+
+    const lookup = await db(env, `compute_enrollments?id=eq.${body.enrollment_id}&select=id,public_key,status`);
+    if (!lookup.ok) return json({ error: "Could not verify node." }, 502);
+    const rows = await lookup.json() as any[];
+    const node = rows[0];
+    if (!node || node.status !== "approved") return json({ error: "Node is not approved." }, 403);
+    const valid = await verifyEd25519(node.public_key, `${body.enrollment_id}:${body.timestamp}`, body.signature);
+    if (!valid) return json({ error: "Invalid node signature." }, 401);
+
+    const lease = Math.min(600, Math.max(60, Number(env.NP_NODE_LEASE_SECONDS || 180)));
+    const now = new Date().toISOString();
+    const expires = new Date(Date.now() + lease * 1000).toISOString();
+    const update = await db(env, `compute_enrollments?id=eq.${body.enrollment_id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ last_seen_at: now, expires_at: expires }),
+    });
+    if (!update.ok) return json({ error: "Heartbeat update failed." }, 502);
+    return json({ status: "ok", lease_expires_at: expires });
+  }
+
+  return json({ error: "Not found." }, 404);
 }
 
 export default {
-  async fetch(
-    request: Request,
-    env: Env
-  ): Promise<Response> {
-    try {
-      if (
-        !env.SUPABASE_URL ||
-        !env.SUPABASE_SERVICE_ROLE_KEY ||
-        !env.NP_CONTROL_TOKEN ||
-        !env.NP_NODE_API_KEY
-      ) {
-        console.error(
-          "A required Worker binding is missing."
-        );
-
-        return json(
-          { error: "Worker configuration is incomplete." },
-          500
-        );
-      }
-
-      return await handleRequest(request, env);
-    } catch (error) {
-      console.error(
-        "Unhandled Worker error:",
-        error
-      );
-
-      return json(
-        { error: "Internal server error." },
-        500
-      );
+  async fetch(request: Request, env: Env): Promise<Response> {
+    try { return await handle(request, env); }
+    catch (error) {
+      console.error("Unhandled Worker error", error);
+      return json({ error: "Internal server error." }, 500);
     }
   },
 };
