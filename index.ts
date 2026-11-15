@@ -128,10 +128,23 @@ async function handle(request: Request, env: Env): Promise<Response> {
     }
 
     let health: Response;
+
     try {
-      health = await fetch(`${endpoint}/health`, { signal: AbortSignal.timeout(8000), redirect: "error" });
-    } catch {
-      return json(request, env, { error: "Could not reach notebook health endpoint." }, 400);
+      health = await fetch(`${endpoint}/health`, {
+        redirect: "manual",
+        signal: AbortSignal.timeout(20000)
+      });
+    } catch (error) {
+      const detail = error instanceof Error
+        ? `${error.name}: ${error.message}`
+        : String(error);
+
+      console.error("Notebook connection diagnostic:", detail);
+
+      return json(request, env, {
+        error: "Could not reach notebook health endpoint.",
+        diagnostic: detail
+      }, 502);
     }
     if (!health.ok) return json(request, env, { error: "Notebook health endpoint returned an error." }, 400);
     const healthBody = await health.json().catch(() => ({})) as any;
