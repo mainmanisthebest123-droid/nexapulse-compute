@@ -180,6 +180,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
     return json(request, env, { enrollment_id: row.id, status: "pending", expires_at: row.expires_at }, 201);
   }
 
+  // Signature-based node heartbeat — MUST stay above the owner-auth block
   if (request.method === "POST" && path === "/v1/nodes/heartbeat") {
     const body = await readJson(request);
     if (!body || !uuid(body.enrollment_id) || typeof body.timestamp !== "number" || typeof body.signature !== "string") {
